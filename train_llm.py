@@ -3,8 +3,6 @@ Training script for Soprano LLM backbone.
 
 Usage:
 python train_llm.py
-
-Adapted from https://github.com/karpathy/nanoGPT
 """
 import os
 import random
@@ -21,35 +19,71 @@ from safetensors.torch import load_file
 from dataset import AudioDataset
 from config_loader import load_config
 
-# Initialize tokenizer globally so it can be used in the collate functions
-tokenizer = AutoTokenizer.from_pretrained('ekwek/Soprano-80M')
-tokenizer.padding_side = 'right' # Essential for training!
 
 def worker_seed_init(_):
     worker_seed = torch.initial_seed() % (2**32-1)
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
-def get_lr(it, max_lr, min_lr, warmup_steps, cooldown_steps, max_steps): # WSD schedule
+
+def get_lr(it, max_lr, min_lr, warmup_steps, cooldown_steps, max_steps):
     if it < warmup_steps:
         return max_lr * (it + 1) / warmup_steps
     if it < max_steps - cooldown_steps:
         return max_lr
     return min_lr + (max_lr - min_lr) * ((max_steps - it) / cooldown_steps)
 
-def collate_dynamic(texts):
-    # Dynamic Batching: Pad to the longest in this batch (max 2048 safety)
+
+def collate_pack(texts, tokenizer, seq_len, batch_size):
+    tokens_batch = tokenizer(texts, padding=False, truncation=False)
+    batch = []
+    cur_sample, cur_size = [], 0
+    for i in range(len(texts)):
+        tokens = torch.tensor(tokens_batch['input_ids'][i][:-1], dtype=torch.long)
+        cur_size += tokens.size(0)
+        cur_sample.append(tokens)
+        if cur_size >= seq_len + 1:
+            batch.append(torch.cat(cur_sample)[: seq_len + 1])
+            cur_sample, cur_size = [], 0
+            if len(batch) == batch_size:
+                break
+    if cur_sample and not batch:
+        batch_item = torch.cat(cur_sample + [torch.zeros(seq_len, dtype=torch.long)])[: seq_len + 1]
+        batch.append(batch_item)
+    if len(batch) < batch_size:
+        pad = batch[-1]
+        while len(batch) < batch_size:
+            batch.append(pad)
+    batch = torch.stack(batch)
+    x = batch[:, :-1]
+    y = batch[:, 1:]
+    return x, y
+
+
+def collate_dynamic(texts, tokenizer):
     tokenized = tokenizer(texts, padding=True, truncation=True, max_length=2048, return_tensors='pt', add_special_tokens=False)
     batch = tokenized['input_ids']
     attn_mask = tokenized['attention_mask']
     
     x = batch[:, :-1]
     y = batch[:, 1:]
-    # Attention mask needs to align with x. Since we shift x by removing the last token,
-    # we should also remove the last token from the mask.
     attn_mask = attn_mask[:, :-1]
     
     return x, y, attn_mask
+
+
+def collate_pack_val(texts, tokenizer, seq_len):
+    out = tokenizer(texts, padding=True, truncation=True, max_length=seq_len+1, return_tensors='pt', add_special_tokens=False)
+    batch = out['input_ids']
+    
+    if batch.size(1) < seq_len + 1:
+        pad_len = seq_len + 1 - batch.size(1)
+        batch = torch.nn.functional.pad(batch, (0, pad_len), value=tokenizer.pad_token_id)
+        
+    x = batch[:, :-1]
+    y = batch[:, 1:]
+    return x, y
+
 
 def compute_loss(x, logits, y, num_steps, mask=None):
     pred = logits.view(-1, logits.size(-1))
@@ -60,28 +94,20 @@ def compute_loss(x, logits, y, num_steps, mask=None):
         mask = mask.reshape(-1)
         loss = loss * mask
     
-    # Audio tokens: >=3 and <=8003. 
-    # NOTE: If [STOP] is 3, it counts as audio.
-    # We apply the mask to filter out padding.
     audio_mask_cond = torch.logical_and(labels >= 3, labels <= 8003)
     if mask is not None:
         audio_mask = audio_mask_cond & (mask > 0)
     else:
         audio_mask = audio_mask_cond
     
-    # Text tokens: The rest, BUT excluding masked (padding) tokens
     if mask is not None:
         text_mask = (~audio_mask_cond) & (mask > 0)
     else:
         text_mask = ~audio_mask_cond
 
-    # Avoid division by zero
     audio_mean = loss[audio_mask].mean() if audio_mask.sum() > 0 else torch.tensor(0.0, device=loss.device)
     text_mean = loss[text_mask].mean() if text_mask.sum() > 0 else torch.tensor(0.0, device=loss.device)
     
-    # Acc: only on non-masked tokens. 
-    # Current logic: (logits.argmax(dim=-1) == y).view(-1)[audio_mask]
-    # This correctly calculates accuracy only on valid audio tokens.
     acc = (logits.argmax(dim=-1).view(-1) == labels).view(-1)[audio_mask].to(torch.float32).mean()
     if torch.isnan(acc): acc = torch.tensor(0.0, device=loss.device)
 
@@ -89,6 +115,7 @@ def compute_loss(x, logits, y, num_steps, mask=None):
     text_loss = text_mean / num_steps
     acc = acc / num_steps
     return audio_loss, text_loss, acc
+
 
 def evaluate(model, val_dataloader, step, device, use_wandb):
     model.eval()
@@ -122,10 +149,7 @@ def evaluate(model, val_dataloader, step, device, use_wandb):
     model.train()
 
 
-if __name__ == '__main__':
-    # ------------------
-    # Load Configuration
-    # ------------------
+def main():
     config = load_config("config.yaml")
     cfg_global = config["global"]
     cfg_paths = config["paths"]
@@ -134,25 +158,26 @@ if __name__ == '__main__':
     device = cfg_global["device"]
     seed = cfg_global["seed"]
     device_type = "cuda" if device.startswith("cuda") else "cpu"
+    tokenizer_name = cfg_global.get("tokenizer_name", "ekwek/Soprano-80M")
     
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
     torch.set_float32_matmul_precision('high')
 
-    # Setup directories
     train_dataset_path = os.path.join(cfg_paths["dataset_root"], "train.json")
     val_dataset_path = os.path.join(cfg_paths["dataset_root"], "val.json")
     save_path = os.path.join(cfg_paths["save_dir"], "llm")
     os.makedirs(save_path, exist_ok=True)
+    
     print(f"Save Path: {save_path}")
 
     if cfg_global["use_wandb"]:
         wandb.init(project=cfg_global["wandb_project"], config=config)
 
-    # ------------------
-    # Hyperparameters
-    # ------------------
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    tokenizer.padding_side = 'right'
+
     max_steps = cfg_llm["max_steps"]
     max_lr = float(cfg_llm["max_lr"])
     min_lr = cfg_llm["min_lr_ratio"] * max_lr
@@ -168,31 +193,25 @@ if __name__ == '__main__':
     betas = tuple(cfg_llm["betas"])
     weight_decay = cfg_llm["weight_decay"]
 
-    # ------------------
-    # Model Setup
-    # ------------------
     if cfg_llm["from_scratch"]:
         print("Initializing model from scratch (random weights)...")
-        m_config = AutoConfig.from_pretrained('ekwek/Soprano-80M')
+        m_config = AutoConfig.from_pretrained(tokenizer_name)
         model = AutoModelForCausalLM.from_config(m_config)
     else:
         pretrained_path = cfg_paths["pretrained_llm_path"]
         if pretrained_path and os.path.exists(pretrained_path):
             print(f"Loading pretrained model weights from {pretrained_path}...")
-            m_config = AutoConfig.from_pretrained('ekwek/Soprano-80M')
+            m_config = AutoConfig.from_pretrained(tokenizer_name)
             model = AutoModelForCausalLM.from_config(m_config)
             state_dict = load_file(pretrained_path)
             model.load_state_dict(state_dict)
         else:
             print("Loading default pretrained model weights from HF...")
-            model = AutoModelForCausalLM.from_pretrained('ekwek/Soprano-80M')
+            model = AutoModelForCausalLM.from_pretrained(tokenizer_name)
 
     model.to(device)
     model.train()
 
-    # ------------------
-    # Dataset Setup
-    # ------------------
     dataset = AudioDataset(train_dataset_path)
     dataloader = DataLoader(
         dataset,
@@ -202,7 +221,7 @@ if __name__ == '__main__':
         pin_memory=True,
         persistent_workers=True,
         worker_init_fn=worker_seed_init,
-        collate_fn=collate_dynamic,
+        collate_fn=lambda texts: collate_dynamic(texts, tokenizer),
     )
     dataloader_it = iter(dataloader)
     
@@ -215,18 +234,11 @@ if __name__ == '__main__':
         pin_memory=True,
         persistent_workers=True,
         worker_init_fn=worker_seed_init,
-        collate_fn=collate_dynamic,
+        collate_fn=lambda texts: collate_dynamic(texts, tokenizer),
     )
 
-    # ------------------
-    # Optimizer
-    # ------------------
     opt = torch.optim.AdamW(model.parameters(), max_lr, betas=betas, weight_decay=weight_decay, fused=True)
 
-    # ------------------
-    # Training Loop
-    # ------------------
-    # Determine start step based on loaded checkpoint if needed, defaulting to 1 for new runs
     start_step = 1 
     pbar = tqdm(range(start_step, max_steps + 1), ncols=200, dynamic_ncols=True)
     
@@ -301,3 +313,6 @@ if __name__ == '__main__':
     
     if cfg_global["use_wandb"]:
         wandb.finish()
+
+if __name__ == '__main__':
+    main()
