@@ -2,98 +2,41 @@
 Training script for Soprano Decoder (Vocos).
 Freezes LLM and trains Decoder with GAN loss.
 """
-import argparse
-import pathlib
 import random
 import time
 import os
 import wandb
 import matplotlib.pyplot as plt
-import io
 
 import numpy as np
 import torch
-import torchaudio
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
 
 from dataset_e2e import AudioDataset, SAMPLES_PER_TOKEN
 from decoder.decoder import SopranoDecoder
 from decoder.discriminator import Discriminator
 from decoder.losses import MelSpectrogramWrapper, feature_matching_loss, discriminator_loss, generator_loss, MultiResolutionSTFTLoss
 
-# Initialize Mel Spectrogram Wrapper
-mel_fn = MelSpectrogramWrapper().to('cuda')
+from config_loader import load_config
 
-
-
-def get_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input-dir",
-        required=False,
-        default="./example_dataset",
-        type=pathlib.Path
-    )
-    parser.add_argument("--save-dir",
-        required=True,
-        type=pathlib.Path
-    )
-    parser.add_argument("--use-disc",
-        action="store_true",
-        help="Whether to use discriminator and GAN losses. Defaults to False (only reconstruction loss)."
-    )
-    return parser.parse_args()
-
-args = get_args()
-
-# training hyperparameters
-device = 'cuda:0'
-seed = 1337
-max_lr = 2e-4 # Lower LR for GAN usually
-warmup_ratio = 0.2
-cooldown_ratio = 0.1
-min_lr = 0.1 * max_lr
-batch_size = 64 # 64
-grad_accum_steps = 1
-seq_len = 1024
-SEGMENT_SIZE_SAMPLES = 32768 # ~1 sec (16 tokens)
-val_freq = 250
-text_factor = 0.0 
-max_steps = 200000
-betas = (0.8, 0.99) # GAN betas
-weight_decay = 0.1
-train_dataset_path = f'{args.input_dir}/train.json'
-val_dataset_path = f'{args.input_dir}/val.json'
-save_path = args.save_dir
-os.makedirs(save_path, exist_ok=True)
-
-# Loss Weights
-lambda_mel = 45.0
-lambda_fm = 2.0
-lambda_gen = 1.0
-lambda_stft = 1.0
+# Global Tokenizer for collate function
+tokenizer = AutoTokenizer.from_pretrained('ekwek/Soprano-80M')
+tokenizer.padding_side = 'right' # Essential for training!
 
 def worker_seed_init(_):
     worker_seed = torch.initial_seed() % (2**32-1)
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
-def get_lr(it): # WSD schedule
-    if it<warmup_steps:
-        return max_lr * (it+1) / warmup_steps
-    if it<max_steps-cooldown_steps:
+def get_lr(it, max_lr, min_lr, warmup_steps, cooldown_steps, max_steps): # WSD schedule
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    if it < max_steps - cooldown_steps:
         return max_lr
-    return min_lr + (max_lr-min_lr) * ((max_steps-it) / cooldown_steps)
-
-# ... (Previous code)
-
-# Initialize Mel Spectrogram Wrapper
-# Place this after device definition (Line 66)
-# But here we are replacing lines 26-43 and 102-130.
-# I will do this in chunks.
-
+    return min_lr + (max_lr - min_lr) * ((max_steps - it) / cooldown_steps)
 
 def collate_pack(batch_in):
     # batch_in is list of (text, wav)
@@ -101,21 +44,14 @@ def collate_pack(batch_in):
     wavs = [x[1] for x in batch_in]
     aud_token_lens = [x[2] for x in batch_in]
     
-    tokens_batch = tokenizer(texts, padding=True, return_tensors='pt')
-    input_ids = tokens_batch['input_ids'] # (B, T)
-    
     # We need to process each sample to align audio
     # Since lengths vary, we process list then pad
-    
     batch_tokens_list = []
     batch_audio_list = []
     
     for i in range(len(texts)):
         # Get raw tokens without padding for alignment logic
         raw_tokens = tokenizer(texts[i], padding=False, truncation=False)['input_ids']
-        tokens = torch.tensor(raw_tokens, dtype=torch.long) # remove last token as per original logic? Or keep?
-        
-        # Taking raw tokens
         tokens = torch.tensor(raw_tokens, dtype=torch.long)
         
         wav = wavs[i]
@@ -125,12 +61,6 @@ def collate_pack(batch_in):
         is_audio = (tokens > 3) & (tokens <= 8003)
         audio_indices = torch.where(is_audio)[0]
         
-        if len(audio_indices) != num_aud_tokens:
-            print(f"Audio token count mismatch: {len(audio_indices)} vs {num_aud_tokens}")
-            print(texts[i])
-            print(raw_tokens)
-            print(is_audio)
-            print(audio_indices)
         assert len(audio_indices) == num_aud_tokens, f"Audio token count mismatch: {len(audio_indices)} vs {num_aud_tokens}"
 
         for pos, idx in enumerate(audio_indices):
@@ -144,70 +74,95 @@ def collate_pack(batch_in):
         batch_audio_list.append(aligned_audio)
 
     # Pad Tokens
-    # We need to return x and y. So we need sequence length T.
-    # tokens are length T+1 (input + target).
-    # Pad to max length
     batch_tokens = torch.nn.utils.rnn.pad_sequence(batch_tokens_list, batch_first=True, padding_value=0)
     
     # Pad Audio
-    # Audio length = tokens_length * SAMPLES_PER_TOKEN
-    # Since 0 token -> 2048 zeros, padding matches.
     batch_audio = torch.nn.utils.rnn.pad_sequence(batch_audio_list, batch_first=True, padding_value=0.0)
     
     x = batch_tokens[:, :-1]
     y = batch_tokens[:, 1:]
     
-    # Audio matches x (length T)
-    # batch_audio was created for length T+1 (full tokens).
-    # We need audio corresponding to x.
-    # Dimensions: batch_audio is (B, (T+1)*2048)
-    # We want up to T*2048
-    
     # Calculate max seq len of x
     max_len_x = x.size(1)
     gt_audio = batch_audio[:, :max_len_x * SAMPLES_PER_TOKEN]
 
-    # Create Attention Mask
-    # Start with x mask
-    # x_mask = (x != 0) # Assumes 0 is padding value used above
-    
     # Create Audio Mask (True where token is audio)
-    audio_mask = (y > 3) & (y <= 8003) # Compute output based on y. I should start collecting outputs from the start_token in x.
+    audio_mask = (y > 3) & (y <= 8003) 
 
     return x, y, gt_audio, audio_mask
 
-tokenizer = AutoTokenizer.from_pretrained('ekwek/Soprano-80M')
-tokenizer.padding_side = 'right' # Essential for training!
 
 if __name__ == '__main__':
+    # ------------------
+    # Load Configuration
+    # ------------------
+    config = load_config("config.yaml")
+    cfg_global = config["global"]
+    cfg_paths = config["paths"]
+    cfg_decoder = config["decoder"]
+
+    device = cfg_global["device"]
+    seed = cfg_global["seed"]
     device_type = "cuda" if device.startswith("cuda") else "cpu"
+    
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
     torch.set_float32_matmul_precision('high')
+
+    # Setup directories
+    train_dataset_path = os.path.join(cfg_paths["dataset_root"], "train.json")
+    val_dataset_path = os.path.join(cfg_paths["dataset_root"], "val.json")
+    save_path = os.path.join(cfg_paths["save_dir"], "decoder")
+    os.makedirs(save_path, exist_ok=True)
     print(f"Save Path: {save_path}")
 
-    # lr schedule
-    warmup_steps = int(max_steps * warmup_ratio)
-    cooldown_steps = int(max_steps * cooldown_ratio)
+    if cfg_global["use_wandb"]:
+        wandb.init(project=cfg_global["wandb_project"], config=config)
 
-    # Initialize WandB
-    wandb.init(project="soprano-decoder-only", config=vars(args))
+    # Initialize Mel Spectrogram Wrapper dynamically
+    mel_fn = MelSpectrogramWrapper().to(device)
 
+    # ------------------
+    # Hyperparameters
+    # ------------------
+    max_steps = cfg_decoder["max_steps"]
+    max_lr = float(cfg_decoder["max_lr"])
+    min_lr = cfg_decoder["min_lr_ratio"] * max_lr
+    warmup_steps = int(max_steps * cfg_decoder["warmup_ratio"])
+    cooldown_steps = int(max_steps * cfg_decoder["cooldown_ratio"])
+    
+    batch_size = cfg_decoder["batch_size"]
+    segment_size_samples = cfg_decoder["segment_size_samples"]
+    val_freq = cfg_decoder["val_freq"]
+    save_freq = cfg_decoder["save_freq"]
+    betas = tuple(cfg_decoder["betas"])
+    weight_decay = cfg_decoder["weight_decay"]
+    start_step = cfg_decoder.get("start_step", 0)
+
+    # Loss Weights
+    lambda_mel = cfg_decoder["lambda_mel"]
+    lambda_fm = cfg_decoder["lambda_fm"]
+    lambda_gen = cfg_decoder["lambda_gen"]
+    lambda_stft = cfg_decoder["lambda_stft"]
+
+    # ------------------
     # 1. Load LLM and Freeze
-    # Load custom trained checkpoint
-    print("Loading LLM from custom checkpoint...")
-    config = AutoConfig.from_pretrained('ekwek/Soprano-80M')
-    model = AutoModelForCausalLM.from_config(config)
+    # ------------------
+    print("Loading LLM...")
+    llm_config = AutoConfig.from_pretrained('ekwek/Soprano-80M')
+    model = AutoModelForCausalLM.from_config(llm_config)
 
-    from safetensors.torch import load_file
-    # ckpt_path = "/home/ubuntu/soma/ckpt/suprano/suprano_llm/codec_1/model.safetensors"
-    # ckpt_path = "/home/ubuntu/soma/ckpt/suprano/suprano_llm/codec_1_2/checkpoint-10000/model.safetensors"
-    # ckpt_path = "/home/ubuntu/soma/ckpt/suprano/suprano_llm/codec_v2/v2/model.safetensors"
-    ckpt_path = "/home/ubuntu/soma/ckpt/suprano/suprano_llm/codec_v2/v2/checkpoint-40000/model.safetensors"
-    # ckpt_path = "/home/ubuntu/soma/ckpt/suprano/suprano_llm/codec_v2/v2/checkpoint-135000/model.safetensors"
-    state_dict = load_file(ckpt_path)
-    model.load_state_dict(state_dict)
+    pretrained_llm_path = cfg_paths["pretrained_llm_path"]
+    if pretrained_llm_path and os.path.exists(pretrained_llm_path):
+        print(f"Loading custom LLM checkpoint from {pretrained_llm_path}")
+        if pretrained_llm_path.endswith('.safetensors'):
+            state_dict = load_file(pretrained_llm_path)
+            model.load_state_dict(state_dict)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(pretrained_llm_path)
+    else:
+        print("Warning: No pretrained LLM provided for Decoder training. Using random init (not recommended).")
 
     model.to(torch.bfloat16).to(device)
     model.eval()
@@ -215,14 +170,19 @@ if __name__ == '__main__':
         param.requires_grad = False
     print("LLM Frozen.")
     
-    # 2. Decoder
+    # ------------------
+    # 2. Load Decoder
+    # ------------------
     print("Loading Decoder...")
     decoder = SopranoDecoder()
-    # decoder_ckpt_path = "/home/ubuntu/soma/ckpt/suprano/suprano_deocoder/codec_1_fix_lens/decoder_step_10000.pth"
-    # decoder_ckpt_path = "/home/ubuntu/soma/ckpt/suprano/suprano_deocoder/codec_v2/v2_40k_w_stft_loss/decoder_trained.pth"
-    decoder_ckpt_path = "/home/ubuntu/soma/ckpt/suprano/suprano_deocoder/codec_v2/v2_40k_w_stft_loss_w_disc/decoder_step_141000.pth"
-    decoder.load_state_dict(torch.load(decoder_ckpt_path, map_location='cpu'))
+    pretrained_decoder_path = cfg_paths["pretrained_decoder_path"]
     
+    if pretrained_decoder_path and os.path.exists(pretrained_decoder_path):
+        print(f"Loading custom Decoder checkpoint from {pretrained_decoder_path}")
+        decoder.load_state_dict(torch.load(pretrained_decoder_path, map_location='cpu'))
+    else:
+        print("Training Decoder from scratch.")
+        
     decoder.to(device)
     decoder.train() 
     print("Decoder loaded.")
@@ -230,27 +190,33 @@ if __name__ == '__main__':
     # Initialize MR-STFT Loss
     mr_stft = MultiResolutionSTFTLoss().to(device)
 
-    # 3. Discriminator
+    # ------------------
+    # 3. Load Discriminator
+    # ------------------
     discriminator = None
-    if args.use_disc:
+    if cfg_decoder["use_discriminator"]:
         print("Initializing Discriminator...")
-
         discriminator = Discriminator()
-
-        disc_model_path = "/home/ubuntu/soma/ckpt/suprano/suprano_deocoder/codec_v2/v2_40k_w_stft_loss_w_disc/discriminator_step_141000.pth"
-        discriminator.load_state_dict(torch.load(disc_model_path, map_location='cpu'))
+        pretrained_disc_path = cfg_paths["pretrained_discriminator_path"]
+        
+        if pretrained_disc_path and os.path.exists(pretrained_disc_path):
+            print(f"Loading custom Discriminator checkpoint from {pretrained_disc_path}")
+            discriminator.load_state_dict(torch.load(pretrained_disc_path, map_location='cpu'))
         
         discriminator.to(device)
         discriminator.train()
     else:
         print("Training WITHOUT Discriminator (Reconstruction only).")
 
-    # 4. Dataset
+    # ------------------
+    # 4. Dataset Setup
+    # ------------------
     dataset = AudioDataset(train_dataset_path)
-    dataloader = DataLoader(dataset,
-        batch_size=8, # change this back
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=cfg_global["num_workers"],
         pin_memory=True,
         persistent_workers=True,
         worker_init_fn=worker_seed_init,
@@ -259,10 +225,11 @@ if __name__ == '__main__':
     dataloader_it = iter(dataloader)
 
     val_dataset = AudioDataset(val_dataset_path)
-    val_dataloader = DataLoader(val_dataset,
-        batch_size=16,
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=max(1, batch_size // 4), # Reduce val batch size to prevent OOM
         shuffle=False,
-        num_workers=4,
+        num_workers=max(1, cfg_global["num_workers"] // 2),
         pin_memory=True,
         persistent_workers=True,
         worker_init_fn=worker_seed_init,
@@ -270,16 +237,19 @@ if __name__ == '__main__':
     )
     val_dataloader_it = iter(val_dataloader)
 
-    # import pdb;pdb.set_trace()
-
+    # ------------------
     # 5. Optimizers
+    # ------------------
     opt_g = torch.optim.AdamW(decoder.parameters(), max_lr, betas=betas, weight_decay=weight_decay)
     opt_d = None
-    if args.use_disc:
+    if cfg_decoder["use_discriminator"]:
         opt_d = torch.optim.AdamW(discriminator.parameters(), max_lr, betas=betas, weight_decay=weight_decay)
 
-    start_step = 141001
-    pbar = tqdm(range(start_step, max_steps), ncols=200, dynamic_ncols=True)
+    # ------------------
+    # Training Loop
+    # ------------------
+    pbar = tqdm(range(start_step + 1, max_steps + 1), ncols=200, dynamic_ncols=True)
+    
     for step in pbar:
         start = time.time()
         
@@ -289,10 +259,7 @@ if __name__ == '__main__':
             if batch_data[0] is None: 
                 dataloader_it = iter(dataloader)
                 batch_data = next(dataloader_it)
-            x, y, gt_audio, audio_mask = batch_data # Audio mask is the audio token mask for token prediction loss here. 
-
-            # import pdb;pdb.set_trace()
-
+            x, y, gt_audio, audio_mask = batch_data 
         except StopIteration:
             dataloader_it = iter(dataloader)
             batch_data = next(dataloader_it)
@@ -310,9 +277,6 @@ if __name__ == '__main__':
                 hidden_states = hidden_states.to(torch.float32)
 
         # GATHER AUDIO LATENTS Logic
-        # We need to extract only the hidden states where audio_mask is True.
-        # Since number of audio tokens varies per sample, we gather and then Pad.
-        
         gathered_states_list = []
         for b_idx in range(hidden_states.size(0)):
             mask = audio_mask[b_idx]
@@ -321,7 +285,6 @@ if __name__ == '__main__':
 
         decoder_in_padded = torch.nn.utils.rnn.pad_sequence(gathered_states_list, batch_first=True, padding_value=0.0)
         
-
         bsz = decoder_in_padded.size(0)
         max_aud_len = decoder_in_padded.size(1)
         audio_loss_mask = torch.zeros((bsz, max_aud_len), dtype=torch.bool, device=device)
@@ -330,26 +293,21 @@ if __name__ == '__main__':
             audio_loss_mask[b_idx, :length] = True
 
         # ---------------------
-        # Train Discriminator
+        # Generator Forward 
         # ---------------------
-        d_loss_item = 0.0
-        if args.use_disc:
-            opt_d.zero_grad()
-            
-            # Generator Forward (Detach for D training)
-            decoder_in = decoder_in_padded.transpose(1, 2) # (B, C, T)
-            fake_audio = decoder(decoder_in) # (B, 1, T_audio_gen)
-            if fake_audio.size(1) == 1: fake_audio = fake_audio.squeeze(1)
-            
+        decoder_in = decoder_in_padded.transpose(1, 2) # (B, C, T)
+        fake_audio = decoder(decoder_in) # (B, 1, T_audio_gen)
+        if fake_audio.size(1) == 1: fake_audio = fake_audio.squeeze(1)
+        
         min_len = min(fake_audio.size(1), gt_audio.size(1))
         fake_audio = fake_audio[:, :min_len]
         real_audio = gt_audio[:, :min_len]
 
         # ---------------------
-        # Train Discriminator (on Crops)
+        # Train Discriminator
         # ---------------------
         d_loss_item = 0.0
-        if args.use_disc:
+        if cfg_decoder["use_discriminator"]:
             opt_d.zero_grad()
             
             # --- Random Cropping Logic ---
@@ -357,33 +315,29 @@ if __name__ == '__main__':
             fake_crop_list = []
             
             for b_idx in range(bsz):
-                # Calculate valid audio length for this sample
                 valid_len = gathered_states_list[b_idx].size(0) * SAMPLES_PER_TOKEN
-                valid_len = min(valid_len, min_len) # Clamp to generated length
+                valid_len = min(valid_len, min_len) 
                 
-                if valid_len <= SEGMENT_SIZE_SAMPLES:
-                    # Pad if shorter
-                    pad_len = SEGMENT_SIZE_SAMPLES - valid_len
+                if valid_len <= segment_size_samples:
+                    pad_len = segment_size_samples - valid_len
                     r_c = torch.nn.functional.pad(real_audio[b_idx, :valid_len], (0, pad_len))
                     f_c = torch.nn.functional.pad(fake_audio[b_idx, :valid_len], (0, pad_len))
                 else:
-                    # Random Crop
-                    start_idx = random.randint(0, valid_len - SEGMENT_SIZE_SAMPLES)
-                    r_c = real_audio[b_idx, start_idx : start_idx + SEGMENT_SIZE_SAMPLES]
-                    f_c = fake_audio[b_idx, start_idx : start_idx + SEGMENT_SIZE_SAMPLES]
+                    start_idx = random.randint(0, valid_len - segment_size_samples)
+                    r_c = real_audio[b_idx, start_idx : start_idx + segment_size_samples]
+                    f_c = fake_audio[b_idx, start_idx : start_idx + segment_size_samples]
                 
                 real_crop_list.append(r_c)
                 fake_crop_list.append(f_c)
             
-            real_crops = torch.stack(real_crop_list).unsqueeze(1) # (B, 1, T_seg)
-            fake_crops = torch.stack(fake_crop_list).unsqueeze(1).detach() # Detach for D update
+            real_crops = torch.stack(real_crop_list).unsqueeze(1) 
+            fake_crops = torch.stack(fake_crop_list).unsqueeze(1).detach() 
 
-            # Disc Forward
             y_d_rs, y_d_gs, _, _ = discriminator(real_crops, fake_crops)
             d_loss, _, _ = discriminator_loss(y_d_rs, y_d_gs)
             
             d_loss.backward()
-            norm_d = torch.nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0)
             opt_d.step()
             d_loss_item = d_loss.item()
         
@@ -392,36 +346,22 @@ if __name__ == '__main__':
         # ---------------------
         opt_g.zero_grad()
         
-        # Re-run generator (or reuse graph if not detached incorrectly)
-        decoder_in = decoder_in_padded.transpose(1, 2)
-        fake_audio = decoder(decoder_in)
-        if fake_audio.size(1) == 1: fake_audio = fake_audio.squeeze(1)
-        
-        min_len = min(fake_audio.size(1), gt_audio.size(1))
-        fake_audio = fake_audio[:, :min_len]
-        real_audio = gt_audio[:, :min_len]
-        
-        # Re-Crop for Generator (Same logic, new random crop or reuse?)
-        # Ideally reuse same crops if we didn't update D? But we did.
-        # Or standard GAN: Update D, then update G.
-        # Usually we crop again (stochasticity helps).
-        # We need "fake_crops_g" (with grad).
-        
+        # We need "fake_crops_g" (with grad) for generator loss
         real_crop_list_g = []
         fake_crop_list_g = []
-        if args.use_disc:
+        if cfg_decoder["use_discriminator"]:
              for b_idx in range(bsz):
                 valid_len = gathered_states_list[b_idx].size(0) * SAMPLES_PER_TOKEN
                 valid_len = min(valid_len, min_len)
                 
-                if valid_len <= SEGMENT_SIZE_SAMPLES:
-                    pad_len = SEGMENT_SIZE_SAMPLES - valid_len
+                if valid_len <= segment_size_samples:
+                    pad_len = segment_size_samples - valid_len
                     r_c = torch.nn.functional.pad(real_audio[b_idx, :valid_len], (0, pad_len))
                     f_c = torch.nn.functional.pad(fake_audio[b_idx, :valid_len], (0, pad_len))
                 else:
-                    start_idx = random.randint(0, valid_len - SEGMENT_SIZE_SAMPLES)
-                    r_c = real_audio[b_idx, start_idx : start_idx + SEGMENT_SIZE_SAMPLES]
-                    f_c = fake_audio[b_idx, start_idx : start_idx + SEGMENT_SIZE_SAMPLES]
+                    start_idx = random.randint(0, valid_len - segment_size_samples)
+                    r_c = real_audio[b_idx, start_idx : start_idx + segment_size_samples]
+                    f_c = fake_audio[b_idx, start_idx : start_idx + segment_size_samples]
                 
                 real_crop_list_g.append(r_c)
                 fake_crop_list_g.append(f_c)
@@ -429,54 +369,31 @@ if __name__ == '__main__':
              real_crops_g = torch.stack(real_crop_list_g).unsqueeze(1)
              fake_crops_g = torch.stack(fake_crop_list_g).unsqueeze(1)
 
-        # Losses
-        # Create Mel Mask
-        # We need mask corresponding to decoder_in (Audio Only)
-        # 1 Token = SAMPLES_PER_TOKEN audio samples
-        # Mel Hop Length = 512
-        # Ratio = SAMPLES_PER_TOKEN / 512 = 4 frames per token
+        # Mel Loss
         frames_per_token = SAMPLES_PER_TOKEN // 512
-        
-        # Expand audio_loss_mask: (B, T_aud) -> (B, T_aud*4)
         mel_mask = audio_loss_mask.repeat_interleave(frames_per_token, dim=1)
         
         pred_mel = mel_fn(fake_audio)
         gt_mel = mel_fn(real_audio)
         
-        # Crop to min length
         min_mel_len = min(pred_mel.size(2), gt_mel.size(2), mel_mask.size(1))
         pred_mel = pred_mel[:, :, :min_mel_len]
         gt_mel = gt_mel[:, :, :min_mel_len]
         mel_mask = mel_mask[:, :min_mel_len]
         
         loss_mel_raw = torch.nn.functional.l1_loss(pred_mel, gt_mel, reduction='none')
-        # Apply mask
         loss_mel = (loss_mel_raw * mel_mask.unsqueeze(1)).sum() / (mel_mask.sum() * pred_mel.size(1) + 1e-6)
         
         # Multi-Resolution STFT Loss
-        # Masking: Apply sample_mask to inputs
-        # Create sample_mask
         sample_mask = audio_loss_mask.repeat_interleave(SAMPLES_PER_TOKEN, dim=1)
-        # Crop to min_len
         sample_mask = sample_mask[:, :min_len]
-        
-        # Apply mask (Assuming padding is zeros, but ensuring it)
-        # This prevents the model from being penalized for non-zero output in padding region (if target is zero)
-        # However, standard MR-STFT computes loss on the full spectrogram.
-        # If we zeroes out padding, STFT of zero is zero. Loss over zero-zero region is zero.
-        # But we divide by total elements (implicitly in mean).
-        # MR-STFT implementation uses averaging over batch/time. 
-        # Ideally we should use a masked reduction.
-        # But for now, let's just zero out inputs.
         
         sc_loss, mag_loss = mr_stft(fake_audio * sample_mask, real_audio * sample_mask)
         
         loss_fm = torch.tensor(0.0, device=device)
         loss_gen = torch.tensor(0.0, device=device)
         
-        
-        if args.use_disc:
-            # Disc Forward Again (No Detach, using Crops)
+        if cfg_decoder["use_discriminator"]:
             y_d_rs, y_d_gs, fmap_rs, fmap_gs = discriminator(real_crops_g, fake_crops_g)
             loss_fm = feature_matching_loss(fmap_rs, fmap_gs)
             loss_gen, _ = generator_loss(y_d_gs)
@@ -487,9 +404,9 @@ if __name__ == '__main__':
         norm_g = torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
         
         # LR Update
-        lr = get_lr(step)
+        lr = get_lr(step, max_lr, min_lr, warmup_steps, cooldown_steps, max_steps)
         for param_group in opt_g.param_groups: param_group['lr'] = lr
-        if args.use_disc:
+        if cfg_decoder["use_discriminator"]:
             for param_group in opt_d.param_groups: param_group['lr'] = lr / 2
             
         opt_g.step()
@@ -512,7 +429,9 @@ if __name__ == '__main__':
             "train/loss_mag": mag_loss.item()
         }
         
-        # Validation Loop & Logging
+        # ---------------------
+        # Validation Loop
+        # ---------------------
         if step % val_freq == 0:
             decoder.eval()
             if discriminator: discriminator.eval()
@@ -523,7 +442,7 @@ if __name__ == '__main__':
             val_d_loss_accum = 0.0
             val_sc_loss_accum = 0.0
             val_mag_loss_accum = 0.0
-            val_steps = 10 # Check 10 batches for speed
+            val_steps = 10 
             
             with torch.no_grad():
                 for _ in range(val_steps):
@@ -542,7 +461,6 @@ if __name__ == '__main__':
                         voutputs = model(vx, output_hidden_states=True)
                         v_hidden = voutputs.hidden_states[-1].to(torch.float32)
                     
-                    # GATHER AUDIO LATENTS Logic
                     v_gathered_states_list = []
                     for b_idx in range(v_hidden.size(0)):
                         mask = vaudio_mask[b_idx]
@@ -551,7 +469,6 @@ if __name__ == '__main__':
                     
                     v_in_padded = torch.nn.utils.rnn.pad_sequence(v_gathered_states_list, batch_first=True, padding_value=0.0)
                     
-                    # Calculate Audio-specific Mask for Loss
                     v_bsz = v_in_padded.size(0)
                     v_max_aud_len = v_in_padded.size(1)
                     v_audio_loss_mask = torch.zeros((v_bsz, v_max_aud_len), dtype=torch.bool, device=device)
@@ -567,7 +484,6 @@ if __name__ == '__main__':
                     v_fake_audio = v_fake_audio[:, :min_len_v]
                     v_real_audio = vgt_audio[:, :min_len_v]
                     
-                    # Val Mel Loss
                     frames_per_token_v = SAMPLES_PER_TOKEN // 512
                     v_mel_mask = v_audio_loss_mask.repeat_interleave(frames_per_token_v, dim=1)
                     
@@ -581,36 +497,30 @@ if __name__ == '__main__':
                     
                     v_mel_loss_raw = torch.nn.functional.l1_loss(v_pred_mel, v_gt_mel, reduction='none')
                     v_mel_loss = (v_mel_loss_raw * v_mel_mask.unsqueeze(1)).sum() / (v_mel_mask.sum() * v_pred_mel.size(1) + 1e-6)
-                    
                     val_mel_loss_accum += v_mel_loss.item()
                     
-                    # Val MR-STFT
                     v_sample_mask = v_audio_loss_mask.repeat_interleave(SAMPLES_PER_TOKEN, dim=1)[:, :min_len_v]
                     v_sc_loss, v_mag_loss = mr_stft(v_fake_audio * v_sample_mask, v_real_audio * v_sample_mask)
                     val_sc_loss_accum += v_sc_loss.item()
                     val_mag_loss_accum += v_mag_loss.item()
                     
-                    if args.use_disc:
-                         # Disc Forward with Cropping (Similar to Training)
+                    if cfg_decoder["use_discriminator"]:
                         v_real_crop_list = []
                         v_fake_crop_list = []
-                        
                         v_min_len = min(v_fake_audio.size(1), v_real_audio.size(1))
                         
                         for b_idx in range(v_bsz):
                             v_valid_len = v_gathered_states_list[b_idx].size(0) * SAMPLES_PER_TOKEN
                             v_valid_len = min(v_valid_len, v_min_len)
                             
-                            if v_valid_len <= SEGMENT_SIZE_SAMPLES:
-                                v_pad_len = SEGMENT_SIZE_SAMPLES - v_valid_len
+                            if v_valid_len <= segment_size_samples:
+                                v_pad_len = segment_size_samples - v_valid_len
                                 vr_c = torch.nn.functional.pad(v_real_audio[b_idx, :v_valid_len], (0, v_pad_len))
                                 vf_c = torch.nn.functional.pad(v_fake_audio[b_idx, :v_valid_len], (0, v_pad_len))
                             else:
-                                # Random Crop (or fixed center crop for determinism in val?)
-                                # Random is fine as it averages out over batches/epochs.
-                                v_start_idx = random.randint(0, v_valid_len - SEGMENT_SIZE_SAMPLES)
-                                vr_c = v_real_audio[b_idx, v_start_idx : v_start_idx + SEGMENT_SIZE_SAMPLES]
-                                vf_c = v_fake_audio[b_idx, v_start_idx : v_start_idx + SEGMENT_SIZE_SAMPLES]
+                                v_start_idx = random.randint(0, v_valid_len - segment_size_samples)
+                                vr_c = v_real_audio[b_idx, v_start_idx : v_start_idx + segment_size_samples]
+                                vf_c = v_fake_audio[b_idx, v_start_idx : v_start_idx + segment_size_samples]
                             
                             v_real_crop_list.append(vr_c)
                             v_fake_crop_list.append(vf_c)
@@ -639,38 +549,39 @@ if __name__ == '__main__':
             log_dict.update(val_log)
 
             # Generate Mel Images (from last val batch)
-            gen_mel = mel_fn(v_fake_audio[0:1]).squeeze(0).cpu().numpy()
-            gt_mel = mel_fn(v_real_audio[0:1]).squeeze(0).cpu().numpy()
+            if cfg_global["use_wandb"]:
+                gen_mel = mel_fn(v_fake_audio[0:1]).squeeze(0).cpu().numpy()
+                gt_mel = mel_fn(v_real_audio[0:1]).squeeze(0).cpu().numpy()
+                
+                fig, ax = plt.subplots(2, 1, figsize=(10, 6))
+                ax[0].imshow(gt_mel, aspect='auto', origin='lower')
+                ax[0].set_title("Ground Truth Mel")
+                ax[1].imshow(gen_mel, aspect='auto', origin='lower')
+                ax[1].set_title("Generated Mel (Val)")
+                plt.tight_layout()
+                
+                log_dict["val/mel_spectrograms"] = wandb.Image(fig)
+                plt.close(fig)
             
-            # Create Plot
-            fig, ax = plt.subplots(2, 1, figsize=(10, 6))
-            ax[0].imshow(gt_mel, aspect='auto', origin='lower')
-            ax[0].set_title("Ground Truth Mel")
-            ax[1].imshow(gen_mel, aspect='auto', origin='lower')
-            ax[1].set_title("Generated Mel (Val)")
-            plt.tight_layout()
-            
-            # Log to WandB
-            log_dict["val/mel_spectrograms"] = wandb.Image(fig)
-            plt.close(fig)
-            
-            # Return to train mode
             decoder.train()
             if discriminator: discriminator.train()
 
         # Save Checkpoint
-        if step > 0 and step % 3000 == 0:
-            print(f"Saving checkpoint at step {step}...")
+        if step > 0 and step % save_freq == 0:
+            print(f"\nSaving checkpoint at step {step} to {save_path}...")
             ckpt_name_dec = f"decoder_step_{step}.pth"
             ckpt_name_disc = f"discriminator_step_{step}.pth"
-            torch.save(decoder.state_dict(), save_path / ckpt_name_dec)
+            torch.save(decoder.state_dict(), os.path.join(save_path, ckpt_name_dec))
             if discriminator:
-                torch.save(discriminator.state_dict(), save_path / ckpt_name_disc)
-            
-        wandb.log(log_dict, step=step)
+                torch.save(discriminator.state_dict(), os.path.join(save_path, ckpt_name_disc))
+        
+        if cfg_global["use_wandb"]:
+            wandb.log(log_dict, step=step)
 
     print(f"Training complete. Saving model at {save_path}")
-    torch.save(decoder.state_dict(), save_path / "decoder_trained.pth")
+    torch.save(decoder.state_dict(), os.path.join(save_path, "decoder_trained.pth"))
     if discriminator:
-        torch.save(discriminator.state_dict(), save_path / "discriminator_trained.pth")
-    wandb.finish()
+        torch.save(discriminator.state_dict(), os.path.join(save_path, "discriminator_trained.pth"))
+        
+    if cfg_global["use_wandb"]:
+        wandb.finish()

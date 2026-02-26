@@ -1,6 +1,52 @@
+# =========================
+# Virtual Environments
+# =========================
+.venv/
+venv/
+env/
+node_modules/
+
+# =========================
+# Python Cache & Build
+# =========================
 __pycache__/
-test.py
-*.json
-*.pth
+*.py[cod]
+*$py.class
+build/
 dist/
 *.egg-info/
+
+# =========================
+# Model Weights & Checkpoints
+# =========================
+*.pth
+*.pt
+*.safetensors
+*.bin
+*.ckpt
+*.onnx
+
+# =========================
+# Specific Files
+# =========================
+test.py
+*.json
+*.jsonl
+code_digest.txt
+
+# =========================
+# Data, Logs, & Outputs
+# =========================
+wandb/
+logs/
+*.wav
+*.flac
+*.mp3
+
+# =========================
+# OS & Editor Files
+# =========================
+.DS_Store
+.env
+.vscode/
+.idea/

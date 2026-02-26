@@ -12,27 +12,8 @@ from codec_model import FSQAutoEncoder
 from codec_dataset import LJSpeechDataset
 from codec.codec_decoder.decoder import SimpleDecoder
 
-# -----------------------------------------------------------------------------
-# Global Configuration
-# -----------------------------------------------------------------------------
-DATASET_ROOT = "/home/ubuntu/soma/data/lj_speech/LJSpeech-1.1"
-SAMPLE_RATE = 32000
-
-BATCH_SIZE = 16
-NUM_EPOCHS = 100
-LEARNING_RATE = 1e-4
-NUM_WORKERS = 8
-
-CKPT_DIR = "/home/ubuntu/soma/ckpt/suprano/suprano_codec/codec_v3"
-
-# Freeze params
-FREEZE_ENCODER = False
-PRETRAINED_MODEL_PATH = "/home/ubuntu/soma/ckpt/suprano/suprano_codec/codec_1/step_42000.pt"
-
-WANDB_PROJECT = "soprano-codec"
-USE_WANDB = True
-# -----------------------------------------------------------------------------
-
+# Import the config loader
+from config_loader import load_config
 
 def pad_collate(batch):
     """
@@ -67,7 +48,7 @@ def save_mel_plot(original_mel, reconstructed_mel, original_title, reconstructed
     plt.close()
 
 
-def evaluate(model, val_loader_it, val_loader, device, step, plot_dir, val_steps=10):
+def evaluate(model, val_loader_it, val_loader, device, step, plot_dir, use_wandb, val_steps=10):
     val_loss = 0.0
     model.eval()
     with torch.no_grad():
@@ -92,7 +73,7 @@ def evaluate(model, val_loader_it, val_loader, device, step, plot_dir, val_steps
     val_loss /= val_steps
     print(f"step {step} | val_loss {val_loss:.4f}")
     
-    if USE_WANDB:
+    if use_wandb:
         wandb.log({"val/loss": val_loss}, step=step)
 
     # Val Plotting
@@ -102,7 +83,7 @@ def evaluate(model, val_loader_it, val_loader, device, step, plot_dir, val_steps
     plot_path = os.path.join(plot_dir, f"val_step_{step:05d}.png")
     save_mel_plot(vmel_np, vmel_hat_np, "Val Original Mel", "Val Reconstructed Mel", plot_path)
     
-    if USE_WANDB:
+    if use_wandb:
         wandb.log({"val/reconstruction": wandb.Image(plot_path)}, step=step)
     
     model.train()
@@ -110,39 +91,47 @@ def evaluate(model, val_loader_it, val_loader, device, step, plot_dir, val_steps
 
 
 def main():
-    if USE_WANDB:
-        wandb.init(project=WANDB_PROJECT)
+    # ------------------
+    # Load Configuration
+    # ------------------
+    config = load_config("config.yaml")
+    cfg_global = config["global"]
+    cfg_paths = config["paths"]
+    cfg_codec = config["codec"]
+
+    if cfg_global["use_wandb"]:
+        wandb.init(project=cfg_global["wandb_project"], config=config)
 
     # ------------------
     # Data Setup
     # ------------------
     dataset = LJSpeechDataset(
-        root=DATASET_ROOT,
-        sample_rate=SAMPLE_RATE,
+        root=cfg_paths["dataset_root"],
+        sample_rate=cfg_codec["sample_rate"],
     )
 
     loader = DataLoader(
         dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=cfg_codec["batch_size"],
         shuffle=True,
         drop_last=True,
-        num_workers=NUM_WORKERS,
+        num_workers=cfg_global["num_workers"],
         pin_memory=True,
         collate_fn=pad_collate
     )
 
     val_dataset = LJSpeechDataset(
-        root=DATASET_ROOT,
-        sample_rate=SAMPLE_RATE,
+        root=cfg_paths["dataset_root"],
+        sample_rate=cfg_codec["sample_rate"],
         mode='val'
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=cfg_codec["batch_size"],
         shuffle=False,
         drop_last=True,
-        num_workers=NUM_WORKERS,
+        num_workers=cfg_global["num_workers"],
         pin_memory=True,
         collate_fn=pad_collate
     )
@@ -154,24 +143,24 @@ def main():
     encoder_cfg = dict(
         num_input_mels=50,
         mel_hop_length=512,
-        encoder_dim=768,
-        encoder_num_layers=8,
+        encoder_dim=cfg_codec["encoder_dim"],
+        encoder_num_layers=cfg_codec["encoder_num_layers"],
         fsq_levels=[8, 8, 5, 5, 5],
     )
 
     decoder_cfg = dict(
         n_mels=50,
-        encoder_dim=768,
-        bottleneck_channels=5,
-        num_layers=8,
+        encoder_dim=cfg_codec["encoder_dim"],
+        bottleneck_channels=cfg_codec["bottleneck_channels"],
+        num_layers=cfg_codec["decoder_num_layers"],
         upsample_scale=2048 // 512,
     )
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = cfg_global["device"] if torch.cuda.is_available() else "cpu"
 
     # Token rate sanity check
     total_hop = 2048 # This is the token hop rate. The mel hop rate is 512
-    print(f"Token rate: {SAMPLE_RATE / total_hop:.2f} Hz")
+    print(f"Token rate: {cfg_codec['sample_rate'] / total_hop:.2f} Hz")
 
     # ------------------
     # Model Setup
@@ -180,12 +169,13 @@ def main():
 
     # Here, we freeze the encoder and only train the decoder from scratch on learned encoder representation. 
     # This is to test whether the encoder has learned how to represent the audio well enough. 
-    if FREEZE_ENCODER:
-        if os.path.exists(PRETRAINED_MODEL_PATH):
-            print(f"Loading model from {PRETRAINED_MODEL_PATH}")
-            model.load_state_dict(torch.load(PRETRAINED_MODEL_PATH, map_location=device))
+    if cfg_codec["freeze_encoder"]:
+        pretrained_path = cfg_paths["pretrained_codec_path"]
+        if pretrained_path and os.path.exists(pretrained_path):
+            print(f"Loading model from {pretrained_path}")
+            model.load_state_dict(torch.load(pretrained_path, map_location=device))
         else:
-            print(f"Warning: Pretrained model path {PRETRAINED_MODEL_PATH} not found.")
+            print(f"Warning: Pretrained model path {pretrained_path} not found.")
 
         # fix encoder; train only the decoder; reset the decoder weights.
         for param in model.encoder.parameters():
@@ -197,10 +187,12 @@ def main():
 
         model.decoder = SimpleDecoder(**decoder_cfg).to(device)
 
-    optimizer = Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE)
+    optimizer = Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=float(cfg_codec["learning_rate"]))
 
-    plot_dir = os.path.join(CKPT_DIR, "plots")
-    os.makedirs(CKPT_DIR, exist_ok=True)
+    # Setup Checkpoint Directories
+    ckpt_dir = os.path.join(cfg_paths["save_dir"], "codec")
+    plot_dir = os.path.join(ckpt_dir, "plots")
+    os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(plot_dir, exist_ok=True)
 
     step = 0
@@ -208,7 +200,7 @@ def main():
     # ------------------
     # Training Loop
     # ------------------
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(cfg_codec["num_epochs"]):
 
         for epoch_step, data in tqdm(enumerate(loader), total=len(loader)):
 
@@ -232,13 +224,13 @@ def main():
 
             if step % 100 == 0:
                 print(f"step {step} | loss {loss.item():.4f}")
-                if USE_WANDB:
+                if cfg_global["use_wandb"]:
                     wandb.log({"train/loss": loss.item()}, step=step)
 
             if step % 400 == 0:
                 val_loader_it = evaluate(
                     model, val_loader_it, val_loader, device, step, plot_dir, 
-                    val_steps=10
+                    cfg_global["use_wandb"], val_steps=10
                 )
 
                 with torch.no_grad():
@@ -249,7 +241,7 @@ def main():
                     unique_bins = len(torch.unique(indices))
                     print(f"[FSQ] unique bins: {unique_bins} / {total_bins}. Lens: {indices.shape} {z.shape}")
                     
-                    if USE_WANDB:
+                    if cfg_global["use_wandb"]:
                         wandb.log({"train/unique_bins": unique_bins}, step=step)
 
             if step % 200 == 0:
@@ -259,11 +251,11 @@ def main():
                 plot_path = os.path.join(plot_dir, f"step_{step:05d}.png")
                 save_mel_plot(mel_np, mel_hat_np, "Original Mel", "Reconstructed Mel", plot_path)
 
-                if USE_WANDB:
+                if cfg_global["use_wandb"]:
                     wandb.log({"train/reconstruction": wandb.Image(plot_path)}, step=step)
 
             if step % 1000 == 0:
-                ckpt_path = os.path.join(CKPT_DIR, f"step_{step:05d}.pt")
+                ckpt_path = os.path.join(ckpt_dir, f"step_{step:05d}.pt")
                 torch.save(model.state_dict(), ckpt_path)
                 print(f"Saved checkpoint to {ckpt_path}")
 

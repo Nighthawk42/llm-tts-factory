@@ -1,0 +1,35 @@
+[project]
+name = "llm-tts-factory"
+version = "0.1.0"
+description = "End-to-End LLM-Backbone TTS Training Framework"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "einops",
+    "huggingface-hub",
+    "matplotlib",
+    "numpy",
+    "pyyaml",
+    "safetensors",
+    "scipy",
+    "soundfile",
+    "torch",
+    "torchaudio",
+    "tqdm",
+    "transformers",
+    "wandb",
+]
+
+[tool.uv]
+# Tells uv this is an application/scripts directory, not a library to be built
+package = false
+
+[tool.uv.sources]
+# Explicitly pull these from the custom PyTorch index
+torch = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

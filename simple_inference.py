@@ -4,10 +4,17 @@ import argparse
 import os
 from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
 from safetensors.torch import load_file
+
 # Ensure decoder module is importable
 from decoder.decoder import SopranoDecoder
+from config_loader import load_config
 
 def load_models(llm_path, decoder_path, device='cuda'):
+    if not llm_path or not os.path.exists(llm_path):
+        raise FileNotFoundError(f"LLM path invalid or not found: {llm_path}. Please check your config.yaml.")
+    if not decoder_path or not os.path.exists(decoder_path):
+        raise FileNotFoundError(f"Decoder path invalid or not found: {decoder_path}. Please check your config.yaml.")
+
     print(f"Loading LLM from {llm_path}...")
     
     # Load LLM Config & Model
@@ -16,7 +23,6 @@ def load_models(llm_path, decoder_path, device='cuda'):
     
     # Load LLM weights
     if llm_path.endswith('.safetensors'):
-        print("loading llm from custom trained model: ", llm_path)
         state_dict = load_file(llm_path)
         llm.load_state_dict(state_dict)
     else:
@@ -26,20 +32,17 @@ def load_models(llm_path, decoder_path, device='cuda'):
     llm.to(device).eval()
     
     print(f"Loading Decoder from {decoder_path}...")
-    # Instantiate Decoder with defaults (matching train_decoder.py)
-    # If training used non-defaults, user must manually edit this line.
+    # Instantiate Decoder with defaults
     decoder = SopranoDecoder()
     
     # Load Decoder weights
-    # Map to cpu first to avoid OOM or device mismatch during load
-    print("Loading decoder from: ", decoder_path)
     decoder_state = torch.load(decoder_path, map_location='cpu')
     decoder.load_state_dict(decoder_state)
     decoder.to(device).eval()
     
     return llm, decoder
 
-def generate_audio(text, llm, decoder, tokenizer, device='cuda', save_path="output.wav"):
+def generate_audio(text, llm, decoder, tokenizer, cfg_inf, device='cuda', save_path="output.wav"):
     # 1. Format Prompt
     prompt = f"[TEXT]{text}[START]"
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
@@ -48,47 +51,35 @@ def generate_audio(text, llm, decoder, tokenizer, device='cuda', save_path="outp
     print("Generating Tokens & Extracting Hidden States...")
     
     # 2. Generate with Hidden States Extraction
-    if 'token_type_ids' in inputs: del inputs['token_type_ids']
+    if 'token_type_ids' in inputs: 
+        del inputs['token_type_ids']
     
     with torch.no_grad():
         outputs = llm.generate(
             input_ids=inputs['input_ids'],
-            attention_mask=inputs['attention_mask'] if 'attention_mask' in inputs else None,
-            max_new_tokens=512, 
+            attention_mask=inputs.get('attention_mask'),
+            max_new_tokens=cfg_inf["max_new_tokens"], 
             do_sample=True,
-            temperature=0.8,
-            top_k=50,
-            top_p=0.95,
+            temperature=cfg_inf["temperature"],
+            top_k=cfg_inf["top_k"],
+            top_p=cfg_inf["top_p"],
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
             return_dict_in_generate=True,
             output_hidden_states=True,
-            repetition_penalty=1.2
+            repetition_penalty=cfg_inf["repetition_penalty"]
         )
     
-
-    # import pdb;pdb.set_trace()
-
     # 3. Process Hidden States
-    # outputs.hidden_states is a tuple of tuples.
-    # Outer tuple: one per generation step.
-    # Inner tuple: one per layer.
-    
     hidden_states_list = []
-    # We only care about the last layer
+    
     # outputs.hidden_states is tuple of generated steps.
     # The first element is the Prompt (prefill) hidden states. We skip it.
     for i, step_states in enumerate(outputs.hidden_states):
         # step_states is tuple of layers. Get last layer.
-        # last_layer_state = step_states[-1][-1]
         last_layer_state = step_states[-1][0, -1, :]
-        
-        # Shape: (Batch, 1, Dim)
-        # print("shape of last layer state is: ", last_layer_state.shape)
         hidden_states_list.append(last_layer_state)
         
-    import pdb;pdb.set_trace()
-
     # Concatenate along time dimension
     # Result: (Batch, T_gen, Dim)
     audio_hidden = torch.stack(hidden_states_list).unsqueeze(0) # (B, T, D)
@@ -122,22 +113,27 @@ def generate_audio(text, llm, decoder, tokenizer, device='cuda', save_path="outp
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--text", type=str, required=True, help="Text to synthesize")
-    parser.add_argument("--llm-path", type=str, required=True, help="Path to LLM checkpoint")
-    parser.add_argument("--decoder-path", type=str, required=True, help="Path to Decoder checkpoint")
-    parser.add_argument("--out", type=str, default="output.wav", help="Output content")
-    
+    parser.add_argument("--out", type=str, default="output.wav", help="Output audio file name")
     args = parser.parse_args()
     
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Load configuration
+    config = load_config("config.yaml")
+    cfg_global = config["global"]
+    cfg_paths = config["paths"]
+    cfg_inf = config["inference"]
+
+    device = cfg_global["device"] if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
     tokenizer = AutoTokenizer.from_pretrained('ekwek/Soprano-80M')
-
     tokenizer.eos_token_id = 3
     
-    llm, decoder = load_models(args.llm_path, args.decoder_path, device)
+    llm_path = cfg_paths["pretrained_llm_path"]
+    decoder_path = cfg_paths["pretrained_decoder_path"]
     
-    generate_audio(args.text, llm, decoder, tokenizer, device, args.out)
+    llm, decoder = load_models(llm_path, decoder_path, device)
+    
+    generate_audio(args.text, llm, decoder, tokenizer, cfg_inf, device, args.out)
 
 if __name__ == "__main__":
     main()

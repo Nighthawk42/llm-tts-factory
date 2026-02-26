@@ -1,0 +1,97 @@
+# ==============================================================================
+# LLM-TTS-Factory Configuration
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Global Settings
+# ------------------------------------------------------------------------------
+global:
+  seed: 1337
+  device: "cuda:0"
+  num_workers: 4
+  use_wandb: true
+  wandb_project: "soprano-tts"
+
+# ------------------------------------------------------------------------------
+# File Paths
+# Use forward slashes (/) for both Windows and Linux, or standard OS paths.
+# Relative paths are evaluated from the directory where the script is run.
+#
+# Examples:
+#   Linux:   "/home/ubuntu/data/lj_speech/LJSpeech-1.1"
+#   Windows: "C:/Users/Name/Documents/datasets/LJSpeech-1.1"
+#   Relative: "./datasets/LJSpeech-1.1"
+# ------------------------------------------------------------------------------
+paths:
+  dataset_root: "./data/LJSpeech-1.1"
+  
+  # Base directory to save all checkpoints and logs
+  save_dir: "./checkpoints"
+  
+  # Pretrained model paths (set to null if training from scratch)
+  # Linux ex: "/home/ubuntu/soma/ckpt/suprano/codec/step_42000.pt"
+  pretrained_codec_path: null
+  pretrained_llm_path: null
+  pretrained_decoder_path: null
+  pretrained_discriminator_path: null
+
+# ------------------------------------------------------------------------------
+# Codec Training Configuration
+# ------------------------------------------------------------------------------
+codec:
+  sample_rate: 32000
+  batch_size: 16
+  num_epochs: 100
+  learning_rate: 1.0e-4
+  freeze_encoder: false
+
+# ------------------------------------------------------------------------------
+# LLM Training Configuration
+# ------------------------------------------------------------------------------
+llm:
+  from_scratch: false
+  batch_size: 64
+  max_steps: 150000
+  max_lr: 2.0e-5
+  min_lr_ratio: 0.3
+  warmup_ratio: 0.3
+  cooldown_ratio: 0.1
+  grad_accum_steps: 1
+  seq_len: 1024
+  val_freq: 250
+  save_freq: 5000
+  text_factor: 0.5
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+
+# ------------------------------------------------------------------------------
+# Decoder (Vocos) Training Configuration
+# ------------------------------------------------------------------------------
+decoder:
+  use_discriminator: true
+  batch_size: 64
+  max_steps: 200000
+  max_lr: 2.0e-4
+  min_lr_ratio: 0.1
+  warmup_ratio: 0.2
+  cooldown_ratio: 0.1
+  grad_accum_steps: 1
+  seq_len: 1024
+  segment_size_samples: 32768  # ~1 sec (16 tokens)
+  val_freq: 250
+  text_factor: 0.0
+  betas: [0.8, 0.99]
+  weight_decay: 0.1
+  
+  # Loss Weights
+  lambda_mel: 45.0
+  lambda_fm: 2.0
+  lambda_gen: 1.0
+  lambda_stft: 1.0
+
+# ------------------------------------------------------------------------------
+# Data Generation Configuration (generate_dataset*.py)
+# ------------------------------------------------------------------------------
+data_generation:
+  val_prop: 0.1
+  val_max: 512
