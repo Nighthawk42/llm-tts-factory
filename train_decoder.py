@@ -3,15 +3,14 @@ Training script for Soprano Decoder (Vocos).
 Freezes LLM and trains Decoder with GAN loss.
 """
 import os
+from functools import partial
 import random
 import time
-import io
 import wandb
 import matplotlib.pyplot as plt
 
 import numpy as np
 import torch
-import torchaudio
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
@@ -116,7 +115,8 @@ def evaluate(step, val_dataloader_it, val_dataloader, model, decoder, discrimina
             vaudio_mask = vaudio_mask.to(device)
             
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                voutputs = model(vx, output_hidden_states=True)
+                # Explicitly name input_ids to satisfy strict typing
+                voutputs = model(input_ids=vx, output_hidden_states=True)
                 v_hidden = voutputs.hidden_states[-1].to(torch.float32)
             
             v_gathered_states_list = []
@@ -210,7 +210,6 @@ def evaluate(step, val_dataloader_it, val_dataloader, model, decoder, discrimina
         })
 
     if use_wandb:
-        # Generate Mel Images (from last val batch)
         gen_mel = mel_fn(v_fake_audio[0:1]).squeeze(0).cpu().numpy()
         gt_mel = mel_fn(v_real_audio[0:1]).squeeze(0).cpu().numpy()
         
@@ -329,6 +328,8 @@ def main():
     # 3. Load Discriminator
     # ------------------
     discriminator = None
+    opt_d = None
+    
     if use_disc:
         print("Initializing Discriminator...")
         discriminator = Discriminator()
@@ -342,6 +343,7 @@ def main():
             
         discriminator.to(device)
         discriminator.train()
+        opt_d = torch.optim.AdamW(discriminator.parameters(), max_lr, betas=betas, weight_decay=weight_decay)
     else:
         print("Training WITHOUT Discriminator (Reconstruction only).")
 
@@ -357,7 +359,7 @@ def main():
         pin_memory=True,
         persistent_workers=True,
         worker_init_fn=worker_seed_init,
-        collate_fn=lambda batch_in: collate_pack(batch_in, tokenizer),
+        collate_fn=partial(collate_pack, tokenizer=tokenizer),
     )
     dataloader_it = iter(dataloader)
 
@@ -370,14 +372,11 @@ def main():
         pin_memory=True,
         persistent_workers=True,
         worker_init_fn=worker_seed_init,
-        collate_fn=lambda batch_in: collate_pack(batch_in, tokenizer),
+        collate_fn=partial(collate_pack, tokenizer=tokenizer),
     )
     val_dataloader_it = iter(val_dataloader)
 
     opt_g = torch.optim.AdamW(decoder.parameters(), max_lr, betas=betas, weight_decay=weight_decay)
-    opt_d = None
-    if use_disc:
-        opt_d = torch.optim.AdamW(discriminator.parameters(), max_lr, betas=betas, weight_decay=weight_decay)
 
     # ------------------
     # Training Loop
@@ -404,7 +403,7 @@ def main():
 
         with torch.no_grad():
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                outputs = model(x, output_hidden_states=True)
+                outputs = model(input_ids=x, output_hidden_states=True)
                 hidden_states = outputs.hidden_states[-1]
                 hidden_states = hidden_states.to(torch.float32)
 
@@ -425,7 +424,7 @@ def main():
 
         d_loss_item = 0.0
 
-        if use_disc:
+        if use_disc and opt_d is not None and discriminator is not None:
             opt_d.zero_grad()
             
             decoder_in = decoder_in_padded.transpose(1, 2)
@@ -478,8 +477,9 @@ def main():
         
         real_crop_list_g = []
         fake_crop_list_g = []
-        if use_disc:
-             for b_idx in range(bsz):
+        
+        if use_disc and discriminator is not None:
+            for b_idx in range(bsz):
                 valid_len = gathered_states_list[b_idx].size(0) * SAMPLES_PER_TOKEN
                 valid_len = min(valid_len, min_len)
                 
@@ -495,8 +495,8 @@ def main():
                 real_crop_list_g.append(r_c)
                 fake_crop_list_g.append(f_c)
             
-             real_crops_g = torch.stack(real_crop_list_g).unsqueeze(1)
-             fake_crops_g = torch.stack(fake_crop_list_g).unsqueeze(1)
+            real_crops_g = torch.stack(real_crop_list_g).unsqueeze(1)
+            fake_crops_g = torch.stack(fake_crop_list_g).unsqueeze(1)
 
         frames_per_token = SAMPLES_PER_TOKEN // 512
         mel_mask = audio_loss_mask.repeat_interleave(frames_per_token, dim=1)
@@ -518,7 +518,7 @@ def main():
         loss_fm = torch.tensor(0.0, device=device)
         loss_gen = torch.tensor(0.0, device=device)
         
-        if use_disc:
+        if use_disc and discriminator is not None:
             y_d_rs, y_d_gs, fmap_rs, fmap_gs = discriminator(real_crops_g, fake_crops_g)
             loss_fm = feature_matching_loss(fmap_rs, fmap_gs)
             loss_gen, _ = generator_loss(y_d_gs)
@@ -530,7 +530,8 @@ def main():
         
         lr = get_lr(step, max_lr, min_lr, warmup_steps, cooldown_steps, max_steps)
         for param_group in opt_g.param_groups: param_group['lr'] = lr
-        if use_disc:
+        
+        if use_disc and opt_d is not None:
             for param_group in opt_d.param_groups: param_group['lr'] = lr / 2
             
         opt_g.step()
@@ -538,6 +539,7 @@ def main():
         end = time.time()
         dt = (end-start)*1000
         
+        # Pylance fix: loss_fm and loss_gen are tensors initialized to 0.0, so .item() works. d_loss_item is a standard float.
         tqdm_log = f'mel: {loss_mel.item():.3f} | gen: {loss_gen.item():.3f} | sc: {sc_loss.item():.3f} | mag: {mag_loss.item():.3f} | fm: {loss_fm.item():.3f} | d: {d_loss_item:.3f} | lr: {lr:.2e} | time: {dt:.2f} ms'
         pbar.set_description(tqdm_log)
 
@@ -576,7 +578,7 @@ def main():
             ckpt_name_dec = f"decoder_step_{step}.pth"
             ckpt_name_disc = f"discriminator_step_{step}.pth"
             torch.save(decoder.state_dict(), os.path.join(save_path, ckpt_name_dec))
-            if discriminator:
+            if discriminator is not None:
                 torch.save(discriminator.state_dict(), os.path.join(save_path, ckpt_name_disc))
         
         if use_wandb:
@@ -584,7 +586,7 @@ def main():
 
     print(f"\nTraining complete. Saving model at {save_path}")
     torch.save(decoder.state_dict(), os.path.join(save_path, "decoder_trained.pth"))
-    if discriminator:
+    if discriminator is not None:
         torch.save(discriminator.state_dict(), os.path.join(save_path, "discriminator_trained.pth"))
         
     if use_wandb:

@@ -5,8 +5,11 @@ Usage:
 python train_llm.py
 """
 import os
+from functools import partial
+from pyexpat import model
 import random
 import time
+from matplotlib.pyplot import step
 import wandb
 
 import numpy as np
@@ -221,7 +224,7 @@ def main():
         pin_memory=True,
         persistent_workers=True,
         worker_init_fn=worker_seed_init,
-        collate_fn=lambda texts: collate_dynamic(texts, tokenizer),
+        collate_fn=partial(collate_dynamic, tokenizer=tokenizer),
     )
     dataloader_it = iter(dataloader)
     
@@ -234,7 +237,7 @@ def main():
         pin_memory=True,
         persistent_workers=True,
         worker_init_fn=worker_seed_init,
-        collate_fn=lambda texts: collate_dynamic(texts, tokenizer),
+        collate_fn=partial(collate_dynamic, tokenizer=tokenizer),
     )
 
     opt = torch.optim.AdamW(model.parameters(), max_lr, betas=betas, weight_decay=weight_decay, fused=True)
@@ -271,9 +274,10 @@ def main():
             logits = model(x, attention_mask=attn_mask).logits
             audio_loss, text_loss, acc = compute_loss(x, logits, y, grad_accum_steps, mask=attn_mask)
             
-            audio_loss_accum += audio_loss.detach()
-            text_loss_accum += text_loss.detach()
-            acc_accum += acc.detach()
+            # CRITICAL FIX: Extract the float value immediately
+            audio_loss_accum += audio_loss.item()
+            text_loss_accum += text_loss.item()
+            acc_accum += acc.item()
             
             total_loss = audio_loss + text_factor * text_loss
             total_loss.backward()
@@ -292,14 +296,14 @@ def main():
         dt = (end - start) * 1000
         tokens_per_second = (batch_size * seq_len * grad_accum_steps) / (end - start)
         
-        tqdm_log = f'text loss: {text_loss_accum.item():.3f} | audio loss: {audio_loss_accum.item():.3f} | acc: {acc_accum.item():.4f} | lr: {lr:.2e} | norm: {norm:.3f} | time: {dt:.2f} ms | {tokens_per_second:.2f} t/s'
+        tqdm_log = f'text loss: {text_loss_accum:.3f} | audio loss: {audio_loss_accum:.3f} | acc: {acc_accum:.4f} | lr: {lr:.2e} | norm: {norm:.3f} | time: {dt:.2f} ms | {tokens_per_second:.2f} t/s'
         pbar.set_description(tqdm_log)
         
         if cfg_global["use_wandb"]:
             wandb.log({
-                "train/text_loss": text_loss_accum.item(),
-                "train/audio_loss": audio_loss_accum.item(),
-                "train/acc": acc_accum.item(),
+                "train/text_loss": text_loss_accum,
+                "train/audio_loss": audio_loss_accum,
+                "train/acc": acc_accum,
                 "train/lr": lr,
                 "train/grad_norm": norm,
                 "train/dt": dt,

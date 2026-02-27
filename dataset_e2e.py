@@ -21,6 +21,10 @@ class AudioDataset(Dataset):
         # [transcript, audio_tokens (list), audio_path]
         text, audio_tokens, audio_path = self.dataset[idx]
         
+        # CRITICAL FIX: We must format the string with the audio tokens physically embedded 
+        # so train_decoder.py can tokenize it and find the audio indices to align the waveform!
+        formatted_text = f"[TEXT]{text}[START]{''.join(list(map(lambda x: f'[{x}]', audio_tokens)))}[STOP]"
+        
         # Use our robust OS-aware pipeline to load the audio
         try:
             wav, _ = AudioPipeline.load_audio(audio_path, target_sr=self.target_sr)
@@ -32,5 +36,5 @@ class AudioDataset(Dataset):
             # Fallback to silence to prevent dataloader crashes
             wav = torch.zeros(len(audio_tokens) * SAMPLES_PER_TOKEN)
 
-        # Return the exact tuple expected by collate_pack in train_decoder.py
-        return text, wav, len(audio_tokens)
+        # Return the formatted string, the waveform, and the token count
+        return formatted_text, wav, len(audio_tokens)

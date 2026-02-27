@@ -2,14 +2,15 @@ import torch
 import torchaudio
 import argparse
 import os
-from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer, PreTrainedModel
+from torch import nn
 from safetensors.torch import load_file
 
 # Ensure decoder module is importable
 from decoder.decoder import SopranoDecoder
 from utils.config_loader import load_config
 
-def load_models(llm_path, decoder_path, device='cuda'):
+def load_models(llm_path: str, decoder_path: str, tokenizer_name: str, device: str = 'cuda') -> tuple[PreTrainedModel, nn.Module]:
     if not llm_path or not os.path.exists(llm_path):
         raise FileNotFoundError(f"LLM path invalid or not found: {llm_path}. Please check your config.yaml.")
     if not decoder_path or not os.path.exists(decoder_path):
@@ -18,7 +19,7 @@ def load_models(llm_path, decoder_path, device='cuda'):
     print(f"Loading LLM from {llm_path}...")
     
     # Load LLM Config & Model
-    config = AutoConfig.from_pretrained('ekwek/Soprano-80M')
+    config = AutoConfig.from_pretrained(tokenizer_name)
     llm = AutoModelForCausalLM.from_config(config)
     
     # Load LLM weights
@@ -32,7 +33,6 @@ def load_models(llm_path, decoder_path, device='cuda'):
     llm.to(device).eval()
     
     print(f"Loading Decoder from {decoder_path}...")
-    # Instantiate Decoder with defaults
     decoder = SopranoDecoder()
     
     # Load Decoder weights
@@ -42,7 +42,7 @@ def load_models(llm_path, decoder_path, device='cuda'):
     
     return llm, decoder
 
-def generate_audio(text, llm, decoder, tokenizer, cfg_inf, device='cuda', save_path="output.wav"):
+def generate_audio(text: str, llm: PreTrainedModel, decoder: nn.Module, tokenizer, cfg_inf: dict, device: str = 'cuda', save_path: str = "output.wav"):
     # 1. Format Prompt
     prompt = f"[TEXT]{text}[START]"
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
@@ -73,7 +73,7 @@ def generate_audio(text, llm, decoder, tokenizer, cfg_inf, device='cuda', save_p
     # 3. Process Hidden States
     hidden_states_list = []
     
-    # outputs.hidden_states is tuple of generated steps.
+    # outputs.hidden_states is a tuple of generated steps.
     # The first element is the Prompt (prefill) hidden states. We skip it.
     for i, step_states in enumerate(outputs.hidden_states):
         # step_states is tuple of layers. Get last layer.
@@ -81,10 +81,7 @@ def generate_audio(text, llm, decoder, tokenizer, cfg_inf, device='cuda', save_p
         hidden_states_list.append(last_layer_state)
         
     # Concatenate along time dimension
-    # Result: (Batch, T_gen, Dim)
     audio_hidden = torch.stack(hidden_states_list).unsqueeze(0) # (B, T, D)
-    
-    # Ensure float32
     audio_hidden = audio_hidden.to(torch.float32)
 
     num_audio_tokens = audio_hidden.size(1)
@@ -95,15 +92,13 @@ def generate_audio(text, llm, decoder, tokenizer, cfg_inf, device='cuda', save_p
         return
 
     # 4. Decode
-    # Decoder expects (B, Channels, T)
     decoder_input = audio_hidden.transpose(1, 2)
-    
     print(f"Decoding shape: {decoder_input.shape}...")
     with torch.no_grad():
         audio = decoder(decoder_input)
     
     # 5. Save
-    audio = audio.squeeze().cpu() # (Samples,) or (1, Samples)
+    audio = audio.squeeze().cpu() 
     if audio.dim() == 1:
         audio = audio.unsqueeze(0)
         
@@ -123,15 +118,16 @@ def main():
     cfg_inf = config["inference"]
 
     device = cfg_global["device"] if torch.cuda.is_available() else "cpu"
+    tokenizer_name = cfg_global.get("tokenizer_name", "ekwek/Soprano-80M")
     print(f"Using device: {device}")
     
-    tokenizer = AutoTokenizer.from_pretrained('ekwek/Soprano-80M')
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     tokenizer.eos_token_id = 3
     
     llm_path = cfg_paths["pretrained_llm_path"]
     decoder_path = cfg_paths["pretrained_decoder_path"]
     
-    llm, decoder = load_models(llm_path, decoder_path, device)
+    llm, decoder = load_models(llm_path, decoder_path, tokenizer_name, device)
     
     generate_audio(args.text, llm, decoder, tokenizer, cfg_inf, device, args.out)
 

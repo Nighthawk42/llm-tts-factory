@@ -33,7 +33,8 @@ test.py
 *.json
 *.jsonl
 code_digest.txt
-uv.lock
+*.lock
+*.bak
 
 # =========================
 # Data, Logs, & Outputs
