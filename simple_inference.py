@@ -7,7 +7,7 @@ from safetensors.torch import load_file
 
 # Ensure decoder module is importable
 from decoder.decoder import SopranoDecoder
-from config_loader import load_config
+from utils.config_loader import load_config
 
 def load_models(llm_path, decoder_path, device='cuda'):
     if not llm_path or not os.path.exists(llm_path):

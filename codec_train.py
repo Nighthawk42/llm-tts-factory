@@ -13,7 +13,7 @@ from codec_dataset import LJSpeechDataset
 from codec.codec_decoder.decoder import SimpleDecoder
 
 # Import the config loader
-from config_loader import load_config
+from utils.config_loader import load_config
 
 def pad_collate(batch):
     """

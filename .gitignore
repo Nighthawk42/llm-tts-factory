@@ -33,12 +33,15 @@ test.py
 *.json
 *.jsonl
 code_digest.txt
+uv.lock
 
 # =========================
 # Data, Logs, & Outputs
 # =========================
 wandb/
 logs/
+dataset/
+datasets/
 *.wav
 *.flac
 *.mp3

@@ -17,7 +17,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from safetensors.torch import load_file
 
 from dataset import AudioDataset
-from config_loader import load_config
+from utils.config_loader import load_config
 
 
 def worker_seed_init(_):

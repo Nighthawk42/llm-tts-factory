@@ -9,17 +9,19 @@ import json
 import os
 import torch
 from tqdm import tqdm
-from encoder.codec import Encoder
+from huggingface_hub import hf_hub_download
+from codec.encoder.codec import Encoder
 
-from config_loader import load_config
+from utils.config_loader import load_config
 from utils.audio_utils import AudioPipeline
 
 def load_metadata(input_dir):
     print("Reading metadata...")
     meta_map = {}
-    meta_path = input_dir / 'metadata_orig.csv'
+    meta_path = input_dir / 'metadata.csv'
+    
     if not meta_path.exists():
-        meta_path = input_dir / 'metadata.csv'
+        raise FileNotFoundError(f"Could not find {meta_path}. Did you run sanitize.py?")
     
     with open(meta_path, encoding='utf-8') as f:
         for line in f:
@@ -82,19 +84,22 @@ def main():
     encoder = Encoder()
     speech_autoencoder_path = cfg_paths["pretrained_codec_path"]
     
-    if not speech_autoencoder_path or not os.path.exists(speech_autoencoder_path):
-        raise FileNotFoundError(f"pretrained_codec_path not found: {speech_autoencoder_path}")
+    if speech_autoencoder_path and os.path.exists(speech_autoencoder_path):
+        print(f"Loading custom weights from {speech_autoencoder_path}")
+        full_ckpt = torch.load(speech_autoencoder_path, map_location='cpu')
         
-    print(f"Loading weights from {speech_autoencoder_path}")
-    full_ckpt = torch.load(speech_autoencoder_path, map_location='cpu')
-    
-    encoder_state_dict = {}
-    for k, v in full_ckpt.items():
-        if k.startswith("encoder."):
-            new_k = k.replace("encoder.", "", 1)
-            encoder_state_dict[new_k] = v
-            
-    encoder.load_state_dict(encoder_state_dict)
+        encoder_state_dict = {}
+        for k, v in full_ckpt.items():
+            if k.startswith("encoder."):
+                new_k = k.replace("encoder.", "", 1)
+                encoder_state_dict[new_k] = v
+                
+        encoder.load_state_dict(encoder_state_dict)
+    else:
+        print("No custom codec path found in config. Downloading default Soprano-Encoder from Hugging Face...")
+        encoder_path = hf_hub_download(repo_id='ekwek/Soprano-Encoder', filename='encoder.pth')
+        encoder.load_state_dict(torch.load(encoder_path, map_location='cpu'))
+        
     encoder.to(device)
     encoder.eval()
     print("Encoder Loaded.")
@@ -109,7 +114,7 @@ def main():
             json.dump(train_data, f, indent=2)
         print(f"Saved {len(train_data)} train samples to {output_dir}/train.json")
     else:
-        print(f"Error: {train_list_path} not found.")
+        print(f"Error: {train_list_path} not found. Skipping train list generation.")
 
     # Process Val List
     val_list_path = input_dir / 'val_list.txt'
@@ -119,7 +124,7 @@ def main():
             json.dump(val_data, f, indent=2)
         print(f"Saved {len(val_data)} val samples to {output_dir}/val.json")
     else:
-        print(f"Error: {val_list_path} not found.")
+        print(f"Error: {val_list_path} not found. Skipping val list generation.")
 
 if __name__ == '__main__':
     main()

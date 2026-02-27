@@ -22,7 +22,7 @@ from decoder.decoder import SopranoDecoder
 from decoder.discriminator import Discriminator
 from decoder.losses import MelSpectrogramWrapper, feature_matching_loss, discriminator_loss, generator_loss, MultiResolutionSTFTLoss
 
-from config_loader import load_config
+from utils.config_loader import load_config
 
 
 def worker_seed_init(_):
