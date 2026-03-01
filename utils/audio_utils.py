@@ -8,6 +8,30 @@ import torchaudio
 
 class AudioPipeline:
     @staticmethod
+    def save_audio(file_path, audio_tensor, sample_rate=32000):
+        """OS-aware audio saving."""
+        system = platform.system()
+        
+        # Ensure audio is on CPU and is a numpy array for universal saving
+        if isinstance(audio_tensor, torch.Tensor):
+            audio_np = audio_tensor.detach().cpu().numpy()
+        else:
+            audio_np = audio_tensor
+            
+        # Ensure shape is (samples,) or (samples, channels) for soundfile
+        if len(audio_np.shape) == 2 and audio_np.shape[0] == 1:
+            audio_np = audio_np.squeeze(0)
+            
+        if system == "Windows":
+            # Windows: torchaudio.save is broken without C++ bindings, use soundfile
+            sf.write(file_path, audio_np, sample_rate)
+        else:
+            # Linux: torchaudio works perfectly
+            # torchaudio expects shape (channels, samples)
+            audio_tensor_save = torch.from_numpy(audio_np).unsqueeze(0).float()
+            torchaudio.save(file_path, audio_tensor_save, sample_rate)
+
+    @staticmethod
     def load_audio(file_path, target_sr=32000):
         """OS-aware audio loading and resampling."""
         system = platform.system()
